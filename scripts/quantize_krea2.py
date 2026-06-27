@@ -26,7 +26,7 @@ try:
 except Exception as exc:  # pragma: no cover - environment dependent
     raise SystemExit(
         "Failed to import comfy_kitchen. Install dependencies first:\n"
-        "  uv pip install -r requirements.txt\n"
+        "  python -m pip install -r requirements.txt\n"
         f"Original error: {exc}"
     )
 
@@ -36,7 +36,6 @@ RECIPES = {
     "nvfp4": ROOT / "metadata" / "krea2_nvfp4_layers.json",
     "fp8_scaled": ROOT / "metadata" / "krea2_fp8_scaled_layers.json",
     "mxfp8": ROOT / "metadata" / "krea2_mxfp8_layers.json",
-    "krea2": ROOT / "metadata" / "krea2_nvfp4_layers.json",
 }
 
 SUPPORTED_FORMATS = {"float8_e4m3fn", "mxfp8", "nvfp4"}
@@ -342,7 +341,11 @@ def parse_args() -> argparse.Namespace:
         description="Quantize a Krea 2 diffusion-model safetensors checkpoint."
     )
     parser.add_argument("--input", required=True, type=Path, help="Krea 2 safetensors")
-    parser.add_argument("--output", required=True, type=Path, help="Output safetensors")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output safetensors. Defaults to <input_stem>_<recipe>.safetensors next to input.",
+    )
     parser.add_argument(
         "--recipe",
         choices=tuple(RECIPES.keys()),
@@ -360,15 +363,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def default_output_path(input_path: Path, recipe: str) -> Path:
+    return input_path.with_name(f"{input_path.stem}_{recipe}.safetensors")
+
+
 def main() -> None:
     args = parse_args()
+    output_path = args.output or default_output_path(args.input, args.recipe)
 
     layers = load_recipe(args.recipe)
     formats = sorted({str(cfg["format"]) for cfg in layers.values()})
     true_count = sum(1 for cfg in layers.values() if cfg.get("full_precision_matrix_mult", False))
     false_count = len(layers) - true_count
     print(f"Input: {args.input}")
-    print(f"Output: {args.output}")
+    print(f"Output: {output_path}")
     print(f"Device: {args.device}")
     print(f"Compute dtype: {args.compute_dtype}")
     print(f"Recipe: {args.recipe}")
@@ -384,7 +392,7 @@ def main() -> None:
     print(f"Input quant formats: {format_counts(source_format_counts)}")
     quantize_checkpoint(
         input_path=args.input,
-        output_path=args.output,
+        output_path=output_path,
         layers=layers,
         layer_prefix=layer_prefix,
         device=args.device,

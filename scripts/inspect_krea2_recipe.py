@@ -13,7 +13,6 @@ RECIPES = {
     "nvfp4": ROOT / "metadata" / "krea2_nvfp4_layers.json",
     "fp8_scaled": ROOT / "metadata" / "krea2_fp8_scaled_layers.json",
     "mxfp8": ROOT / "metadata" / "krea2_mxfp8_layers.json",
-    "krea2": ROOT / "metadata" / "krea2_nvfp4_layers.json",
 }
 
 LAYER_PREFIXES = (
@@ -83,6 +82,8 @@ def main() -> None:
         print(f"missing: {key}")
     for key, shape in not_2d[:20]:
         print(f"not_2d: {key} {shape}")
+    if missing or not_2d:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

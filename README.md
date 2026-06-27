@@ -1,75 +1,81 @@
 # krea2-quantizer
 
-Krea 2 diffusion-model `.safetensors` を ComfyUI 用の量子化 checkpoint に変換します。
+Quantize a Krea 2 diffusion-model `.safetensors` checkpoint for ComfyUI.
 
-## セットアップ
+## Requirements
 
-```powershell
-uv venv
-uv pip install -r requirements.txt
+- Python 3.10+
+- CUDA-capable PyTorch environment
+- Krea 2 diffusion model `.safetensors`
+
+## Setup
+
+```bash
+python -m pip install -r requirements.txt
 ```
 
-CUDA の確認:
+Check CUDA:
 
-```powershell
-.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
+```bash
+python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
 ```
 
-## Recipe
+## Recipes
 
-```text
-nvfp4
-fp8_scaled
-mxfp8
-```
+- `nvfp4`
+- `fp8_scaled`
+- `mxfp8`
 
-## 検査
+## Quantize
 
-```powershell
-.\.venv\Scripts\python.exe scripts\inspect_krea2_nvfp4_metadata.py `
-  --recipe nvfp4 `
-  --source "L:\models\krea2\diffusion_models\krea2_raw_bf16.safetensors"
-```
+NVFP4:
 
-成功時の目安:
-
-```text
-missing .weight keys: 0
-non-2D .weight keys: 0
-```
-
-## 変換
-
-```powershell
-.\.venv\Scripts\python.exe scripts\quantize_krea2_nvfp4.py `
-  --input "L:\models\krea2\diffusion_models\krea2_raw_bf16.safetensors" `
-  --output "L:\models\krea2\diffusion_models\krea2_raw_nvfp4.safetensors" `
-  --recipe nvfp4 `
+```bash
+python scripts/quantize_krea2.py \
+  --input /path/to/krea2_raw_bf16.safetensors \
+  --recipe nvfp4 \
   --device cuda
 ```
 
-```powershell
-.\.venv\Scripts\python.exe scripts\quantize_krea2_nvfp4.py `
-  --input "L:\models\krea2\diffusion_models\krea2_raw_bf16.safetensors" `
-  --output "L:\models\krea2\diffusion_models\krea2_raw_fp8_scaled.safetensors" `
-  --recipe fp8_scaled `
+FP8 scaled:
+
+```bash
+python scripts/quantize_krea2.py \
+  --input /path/to/krea2_raw_bf16.safetensors \
+  --recipe fp8_scaled \
   --device cuda
 ```
 
-```powershell
-.\.venv\Scripts\python.exe scripts\quantize_krea2_nvfp4.py `
-  --input "L:\models\krea2\diffusion_models\krea2_raw_bf16.safetensors" `
-  --output "L:\models\krea2\diffusion_models\krea2_raw_mxfp8.safetensors" `
-  --recipe mxfp8 `
+MXFP8:
+
+```bash
+python scripts/quantize_krea2.py \
+  --input /path/to/krea2_raw_bf16.safetensors \
+  --recipe mxfp8 \
   --device cuda
 ```
 
 ## Dry Run
 
-```powershell
-.\.venv\Scripts\python.exe scripts\quantize_krea2_nvfp4.py `
-  --input "L:\models\krea2\diffusion_models\krea2_raw_bf16.safetensors" `
-  --output "L:\models\krea2\diffusion_models\dummy.safetensors" `
-  --recipe nvfp4 `
+```bash
+python scripts/quantize_krea2.py \
+  --input /path/to/krea2_raw_bf16.safetensors \
+  --recipe nvfp4 \
   --dry-run
 ```
+
+## Options
+
+```bash
+python scripts/quantize_krea2.py --help
+```
+
+- `--recipe`: `nvfp4`, `fp8_scaled`, or `mxfp8`
+- `--input`: input `.safetensors` file path, required
+- `--output`: output `.safetensors` file path
+- `--device`: quantization device, default `cuda`
+- `--compute-dtype`: `bf16`, `fp16`, or `fp32`, default `bf16`
+- `--dry-run`: validate input without writing output
+
+If `--output` is omitted, the output path defaults to the input file path with `_<recipe>` appended before `.safetensors`, for example `/path/to/krea2_raw_bf16_nvfp4.safetensors`.
+If the input checkpoint does not match the selected recipe, the command exits with an error.
