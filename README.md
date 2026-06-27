@@ -2,6 +2,17 @@
 
 Quantize a Krea 2 diffusion-model `.safetensors` checkpoint for ComfyUI.
 
+## How to Use
+
+Tell your AI agent:
+
+```text
+Set up the repository at https://github.com/blue-pen5805/krea2-quantizer.
+Use it to quantize my Krea 2 diffusion-model .safetensors for ComfyUI.
+```
+
+Or follow the manual setup steps below.
+
 ## Requirements
 
 - Python 3.10+
