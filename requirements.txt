@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch>=2.5.0
+safetensors>=0.5.0
+tqdm>=4.66.0
+numpy>=1.26.0
+packaging>=23.0
+comfy-kitchen[cublas]>=0.2.13,<0.3.0
