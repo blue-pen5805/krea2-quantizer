@@ -101,3 +101,7 @@ still requires the packages in `requirements.txt`.
 
 If `--output` is omitted, the output path defaults to the input file path with `_<recipe>` appended before `.safetensors`, for example `/path/to/krea2_raw_bf16_nvfp4.safetensors`.
 If the input checkpoint does not match the selected recipe, the command exits with an error.
+
+## Metadata Source
+
+The metadata was obtained from https://huggingface.co/Comfy-Org/Krea-2.
