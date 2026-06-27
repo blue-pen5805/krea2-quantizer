@@ -5,8 +5,13 @@ Quantize a Krea 2 diffusion-model `.safetensors` checkpoint for ComfyUI.
 ## Requirements
 
 - Python 3.10+
-- CUDA-capable PyTorch environment
+- NVIDIA GPU with a CUDA-capable PyTorch environment
+- Recent NVIDIA driver compatible with the PyTorch CUDA wheel you install
 - Krea 2 diffusion model `.safetensors`
+
+This repository installs PyTorch from the CUDA 13.0 wheel index in `requirements.txt`.
+If your machine needs a different CUDA wheel, install the matching PyTorch build first,
+then install the remaining requirements.
 
 ## Setup
 
@@ -19,6 +24,9 @@ Check CUDA:
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
 ```
+
+The final line must print `True` when using `--device cuda`. If it prints `False`,
+fix the PyTorch/CUDA installation before running quantization.
 
 ## Recipes
 
@@ -69,6 +77,9 @@ python scripts/quantize_krea2.py \
 ```bash
 python scripts/quantize_krea2.py --help
 ```
+
+This help command works before installing the runtime dependencies. Quantization itself
+still requires the packages in `requirements.txt`.
 
 - `--recipe`: `nvfp4`, `fp8_scaled`, or `mxfp8`
 - `--input`: input `.safetensors` file path, required

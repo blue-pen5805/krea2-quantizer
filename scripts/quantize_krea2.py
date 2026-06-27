@@ -11,25 +11,6 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-import torch
-from safetensors import safe_open
-from safetensors.torch import save_file
-from tqdm import tqdm
-
-try:
-    from comfy_kitchen.tensor import (
-        QuantizedTensor,
-        TensorCoreFP8Layout,
-        TensorCoreMXFP8Layout,
-        TensorCoreNVFP4Layout,
-    )
-except Exception as exc:  # pragma: no cover - environment dependent
-    raise SystemExit(
-        "Failed to import comfy_kitchen. Install dependencies first:\n"
-        "  python -m pip install -r requirements.txt\n"
-        f"Original error: {exc}"
-    )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 RECIPES = {
@@ -47,16 +28,41 @@ AUX_SUFFIXES = (
     ".comfy_quant",
 )
 
-DTYPES = {
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-}
+DTYPE_NAMES = ("bf16", "fp16", "fp32")
 
 LAYER_PREFIXES = (
     "",
     "model.diffusion_model.",
 )
+
+
+def load_runtime_dependencies() -> Dict[str, Any]:
+    global torch, safe_open, save_file, tqdm
+    global QuantizedTensor, TensorCoreFP8Layout, TensorCoreMXFP8Layout, TensorCoreNVFP4Layout
+
+    try:
+        import torch
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+        from tqdm import tqdm
+        from comfy_kitchen.tensor import (
+            QuantizedTensor,
+            TensorCoreFP8Layout,
+            TensorCoreMXFP8Layout,
+            TensorCoreNVFP4Layout,
+        )
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise SystemExit(
+            "Failed to import runtime dependencies. Install dependencies first:\n"
+            "  python -m pip install -r requirements.txt\n"
+            f"Original error: {exc}"
+        )
+
+    return {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }
 
 
 def read_json(path: Path) -> Any:
@@ -355,7 +361,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Quantization device")
     parser.add_argument(
         "--compute-dtype",
-        choices=tuple(DTYPES.keys()),
+        choices=DTYPE_NAMES,
         default="bf16",
         help="dtype used while quantizing weights",
     )
@@ -369,6 +375,7 @@ def default_output_path(input_path: Path, recipe: str) -> Path:
 
 def main() -> None:
     args = parse_args()
+    dtypes = load_runtime_dependencies()
     output_path = args.output or default_output_path(args.input, args.recipe)
 
     layers = load_recipe(args.recipe)
@@ -396,7 +403,7 @@ def main() -> None:
         layers=layers,
         layer_prefix=layer_prefix,
         device=args.device,
-        compute_dtype=DTYPES[args.compute_dtype],
+        compute_dtype=dtypes[args.compute_dtype],
         dry_run=args.dry_run,
     )
 
