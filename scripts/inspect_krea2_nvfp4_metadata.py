@@ -10,6 +10,9 @@ from safetensors import safe_open
 
 ROOT = Path(__file__).resolve().parents[1]
 RECIPES = {
+    "nvfp4": ROOT / "metadata" / "krea2_nvfp4_layers.json",
+    "fp8_scaled": ROOT / "metadata" / "krea2_fp8_scaled_layers.json",
+    "mxfp8": ROOT / "metadata" / "krea2_mxfp8_layers.json",
     "krea2": ROOT / "metadata" / "krea2_nvfp4_layers.json",
 }
 
@@ -32,11 +35,11 @@ def detect_layer_prefix(keys: set[str], layers) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Inspect the built-in Krea 2 NVFP4 recipe.")
+    parser = argparse.ArgumentParser(description="Inspect a built-in Krea 2 quantization recipe.")
     parser.add_argument(
         "--recipe",
         choices=tuple(RECIPES.keys()),
-        default="krea2",
+        default="nvfp4",
         help="Built-in Krea 2 recipe",
     )
     parser.add_argument("--source", type=Path, help="Optional Krea 2 safetensors to validate")
@@ -49,8 +52,10 @@ def main() -> None:
 
     true_count = sum(1 for cfg in layers.values() if cfg.get("full_precision_matrix_mult", False))
     false_count = len(layers) - true_count
+    formats = sorted({str(cfg["format"]) for cfg in layers.values()})
     print(f"recipe: {args.recipe}")
     print(f"layers: {len(layers)}")
+    print(f"formats: {', '.join(formats)}")
     print(f"full_precision_matrix_mult=true : {true_count}")
     print(f"full_precision_matrix_mult=false: {false_count}")
 
