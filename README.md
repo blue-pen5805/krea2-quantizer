@@ -1,5 +1,7 @@
 # krea2-quantizer
 
+[ENGLISH](README.md) | [日本語](README_JP.md)
+
 Quantize a Krea 2 diffusion-model `.safetensors` checkpoint for ComfyUI.
 
 ## How to Use
