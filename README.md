@@ -8,7 +8,8 @@ Tell your AI agent:
 
 ```text
 Set up the repository at https://github.com/blue-pen5805/krea2-quantizer.
-Use it to quantize my Krea 2 diffusion-model .safetensors for ComfyUI.
+Stop after the environment setup is complete.
+Then ask me for the location of my Krea 2 diffusion-model .safetensors file before running quantization.
 ```
 
 Or follow the manual setup steps below.
