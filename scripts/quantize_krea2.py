@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -96,6 +98,8 @@ def load_runtime_dependencies() -> Dict[str, Any]:
     except Exception as exc:  # pragma: no cover - environment dependent
         raise SystemExit(
             "Failed to import runtime dependencies. Install dependencies first:\n"
+            "  install a CUDA-capable PyTorch build first "
+            "(CUDA 13.0 is recommended for nvfp4; see README.md)\n"
             "  python -m pip install -r requirements.txt\n"
             f"Original error: {exc}"
         )
@@ -178,6 +182,7 @@ def validate_krea2_source(input_path: Path, layers: Mapping[str, Mapping[str, An
     missing = []
     not_2d = []
     not_supported = []
+    missing_aux = []
 
     with safe_open(str(input_path), framework="pt", device="cpu") as f:
         keys = set(f.keys())
@@ -193,13 +198,21 @@ def validate_krea2_source(input_path: Path, layers: Mapping[str, Mapping[str, An
                 not_2d.append((key, tuple(tensor.shape)))
 
             source_format = infer_source_format(f, full_layer, tensor)
+            for aux_key in required_aux_keys_for_source_format(
+                full_layer,
+                source_format,
+                tensor,
+                keys,
+            ):
+                if aux_key not in keys:
+                    missing_aux.append(aux_key)
             if tensor.is_floating_point():
                 continue
             if source_format in SUPPORTED_SOURCE_FORMATS:
                 continue
             not_supported.append((key, str(tensor.dtype), source_format))
 
-    if not (missing or not_2d or not_supported):
+    if not (missing or not_2d or not_supported or missing_aux):
         return prefix
 
     print("Input is not compatible with the selected Krea 2 recipe:", file=sys.stderr)
@@ -215,6 +228,10 @@ def validate_krea2_source(input_path: Path, layers: Mapping[str, Mapping[str, An
         print(f"  unsupported .weight tensors: {len(not_supported)}", file=sys.stderr)
         for key, dtype, source_format in not_supported[:30]:
             print(f"    - {key}: {dtype}, format={source_format}", file=sys.stderr)
+    if missing_aux:
+        print(f"  missing quantization auxiliary tensors: {len(missing_aux)}", file=sys.stderr)
+        for key in missing_aux[:30]:
+            print(f"    - {key}", file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -261,6 +278,35 @@ def require_tensor(f, key: str):
     if key not in f.keys():
         raise ValueError(f"Missing source tensor: {key}")
     return f.get_tensor(key)
+
+
+def required_aux_keys_for_source_format(
+    layer: str,
+    source_format: Optional[str],
+    tensor,
+    keys: set[str],
+) -> tuple[str, ...]:
+    looks_like_fp8 = str(tensor.dtype).startswith("torch.float8")
+
+    if source_format in MXFP8_SOURCE_FORMATS:
+        return (f"{layer}.weight_scale",)
+    if source_format in NVFP4_SOURCE_FORMATS:
+        return (f"{layer}.weight_scale", f"{layer}.weight_scale_2")
+    if source_format in INT8_SOURCE_FORMATS:
+        return (f"{layer}.weight_scale",)
+    if source_format in AWQ_SOURCE_FORMATS:
+        return (f"{layer}.weight_scale", f"{layer}.weight_zeros")
+    if source_format in SVDQUANT_SOURCE_FORMATS:
+        return (
+            f"{layer}.weight_scale",
+            f"{layer}.weight_proj_down",
+            f"{layer}.weight_proj_up",
+            f"{layer}.weight_smooth_factor",
+        )
+    if source_format in FP8_SOURCE_FORMATS or looks_like_fp8:
+        scale_key = f"{layer}.weight_scale"
+        return (scale_key,) if scale_key in keys else ()
+    return ()
 
 
 def infer_awq_group_size(qdata: torch.Tensor, scale: torch.Tensor, cfg: Mapping[str, Any]) -> int:
@@ -413,6 +459,50 @@ def output_key_for_state_tensor(layer: str, state_suffix: str) -> str:
     return f"{layer}{suffixes[state_suffix]}"
 
 
+def merged_quantization_metadata(
+    input_metadata: Mapping[str, str],
+    quantized_layers: Mapping[str, Mapping[str, Any]],
+) -> str:
+    metadata_layers: Dict[str, Any] = {}
+    existing_raw = input_metadata.get("_quantization_metadata")
+    if existing_raw:
+        try:
+            existing = json.loads(existing_raw)
+        except json.JSONDecodeError:
+            existing = None
+        if isinstance(existing, dict) and isinstance(existing.get("layers"), dict):
+            metadata_layers.update(existing["layers"])
+
+    metadata_layers.update(quantized_layers)
+    return json.dumps(
+        {"format_version": "1.0", "layers": metadata_layers},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def save_file_atomically(
+    tensors: Mapping[str, torch.Tensor],
+    output_path: Path,
+    metadata: Mapping[str, str],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        save_file(dict(tensors), str(tmp_path), metadata=dict(metadata))
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
 def quantize_checkpoint(
     input_path: Path,
     output_path: Path,
@@ -424,6 +514,11 @@ def quantize_checkpoint(
     warned_missing_fp8_scale: Optional[set[str]] = None,
 ) -> None:
     target_weight_keys = {f"{layer_prefix}{layer}.weight": f"{layer_prefix}{layer}" for layer in layers}
+    target_aux_keys = {
+        f"{layer_prefix}{layer}{suffix}"
+        for layer in layers
+        for suffix in AUX_SUFFIXES
+    }
     output: "OrderedDict[str, torch.Tensor]" = OrderedDict()
     quantized_layers: Dict[str, Dict[str, Any]] = {}
     if warned_missing_fp8_scale is None:
@@ -439,7 +534,7 @@ def quantize_checkpoint(
             return
 
         for key in tqdm(keys, desc="Converting tensors"):
-            if key.endswith(AUX_SUFFIXES):
+            if key in target_aux_keys:
                 continue
 
             tensor = f.get_tensor(key)
@@ -476,15 +571,12 @@ def quantize_checkpoint(
                 torch.cuda.empty_cache()
 
     output_metadata = safetensors_metadata(input_path)
-    output_metadata.pop("_quantization_metadata", None)
-    output_metadata["_quantization_metadata"] = json.dumps(
-        {"format_version": "1.0", "layers": quantized_layers},
-        separators=(",", ":"),
-        ensure_ascii=False,
+    output_metadata["_quantization_metadata"] = merged_quantization_metadata(
+        output_metadata,
+        quantized_layers,
     )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_file(output, str(output_path), metadata=output_metadata)
+    save_file_atomically(output, output_path, output_metadata)
 
     print(f"Saved: {output_path}")
     print(f"Quantized layers: {len(quantized_layers)}")
@@ -514,6 +606,11 @@ def parse_args() -> argparse.Namespace:
         help="dtype used while quantizing weights",
     )
     parser.add_argument("--dry-run", action="store_true", help="Validate only; do not write output")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacing an existing output file. The input file can never be overwritten.",
+    )
     return parser.parse_args()
 
 
@@ -521,10 +618,28 @@ def default_output_path(input_path: Path, recipe: str) -> Path:
     return input_path.with_name(f"{input_path.stem}_{recipe}.safetensors")
 
 
+def validate_output_path(
+    input_path: Path,
+    output_path: Path,
+    overwrite: bool,
+    dry_run: bool,
+) -> None:
+    input_resolved = input_path.resolve(strict=False)
+    output_resolved = output_path.resolve(strict=False)
+    if output_resolved == input_resolved:
+        raise SystemExit("Output path must be different from input path.")
+    if not dry_run and output_path.exists() and not overwrite:
+        raise SystemExit(
+            f"Output file already exists: {output_path}\n"
+            "Pass --overwrite to replace it."
+        )
+
+
 def main() -> None:
     args = parse_args()
-    dtypes = load_runtime_dependencies()
     output_path = args.output or default_output_path(args.input, args.recipe)
+    validate_output_path(args.input, output_path, args.overwrite, args.dry_run)
+    dtypes = load_runtime_dependencies()
 
     layers = load_recipe(args.recipe)
     formats = sorted({str(cfg["format"]) for cfg in layers.values()})

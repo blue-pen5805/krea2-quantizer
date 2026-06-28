@@ -20,11 +20,21 @@ Or follow the manual setup steps below.
 - Recent NVIDIA driver compatible with the PyTorch CUDA wheel you install
 - Krea 2 diffusion model `.safetensors`
 
-This repository installs PyTorch from the CUDA 13.0 wheel index in `requirements.txt`.
-If your machine needs a different CUDA wheel, install the matching PyTorch build first,
-then install the remaining requirements.
+Install PyTorch separately before the remaining requirements. CUDA 13.0 is recommended,
+because the `nvfp4` recipe requires NVFP4 support.
+
+If CUDA 13.0 works on your machine:
+
+```bash
+python -m pip install --index-url https://download.pytorch.org/whl/cu130 torch
+```
+
+If your machine needs a different CUDA wheel, install the matching PyTorch build first
+from the official PyTorch instructions, then install the remaining requirements.
 
 ## Setup
+
+After PyTorch is installed:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -98,8 +108,11 @@ still requires the packages in `requirements.txt`.
 - `--device`: quantization device, default `cuda`
 - `--compute-dtype`: `bf16`, `fp16`, or `fp32`, default `bf16`
 - `--dry-run`: validate input without writing output
+- `--overwrite`: replace an existing output file. The input file can never be overwritten.
 
 If `--output` is omitted, the output path defaults to the input file path with `_<recipe>` appended before `.safetensors`, for example `/path/to/krea2_raw_bf16_nvfp4.safetensors`.
+If the output file already exists, the command exits with an error unless `--overwrite` is passed.
+Using the same path for `--input` and `--output` is always an error.
 If the input checkpoint does not match the selected recipe, the command exits with an error.
 
 ## Metadata Source
