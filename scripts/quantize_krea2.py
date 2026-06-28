@@ -148,10 +148,34 @@ def detect_layer_prefix(keys: set[str], layers: Mapping[str, Mapping[str, Any]])
 
 def quantized_layer_config(f, layer: str) -> Optional[Dict[str, Any]]:
     key = f"{layer}.comfy_quant"
-    if key not in f.keys():
+    if key in f.keys():
+        raw = f.get_tensor(key).numpy().tobytes()
+        return json.loads(raw)
+
+    metadata = f.metadata() or {}
+    raw_metadata = metadata.get("_quantization_metadata")
+    if not raw_metadata:
         return None
-    raw = f.get_tensor(key).numpy().tobytes()
-    return json.loads(raw)
+
+    try:
+        quantization_metadata = json.loads(raw_metadata)
+    except json.JSONDecodeError:
+        return None
+
+    layers = quantization_metadata.get("layers")
+    if not isinstance(layers, dict):
+        return None
+
+    layer_names = [layer]
+    for prefix in LAYER_PREFIXES:
+        if prefix and layer.startswith(prefix):
+            layer_names.append(layer.removeprefix(prefix))
+
+    for layer_name in layer_names:
+        cfg = layers.get(layer_name)
+        if isinstance(cfg, dict):
+            return dict(cfg)
+    return None
 
 
 def normalized_source_format(source_format: Optional[str]) -> Optional[str]:
@@ -448,6 +472,27 @@ def state_dict_tensors_for_format(
     raise ValueError(f"Unsupported target format: {target_format}")
 
 
+def mxfp8_state_tensor_for_safetensors(
+    state_suffix: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    tensor = tensor.detach().cpu().contiguous()
+    if state_suffix != "_scale":
+        return tensor
+    if str(tensor.dtype) == "torch.uint8":
+        return tensor
+
+    try:
+        import torch as torch_module
+
+        return tensor.view(torch_module.uint8)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Failed to reinterpret MXFP8 weight_scale as uint8 for "
+            "Comfy-Org-compatible safetensors output."
+        ) from exc
+
+
 def output_key_for_state_tensor(layer: str, state_suffix: str) -> str:
     suffixes = {
         "": ".weight",
@@ -475,10 +520,29 @@ def merged_quantization_metadata(
 
     metadata_layers.update(quantized_layers)
     return json.dumps(
-        {"format_version": "1.0", "layers": metadata_layers},
+        {"layers": metadata_layers},
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+def official_metadata_layer_config(layer_config: Mapping[str, Any]) -> Dict[str, Any]:
+    target_format = str(layer_config["format"])
+    cfg: Dict[str, Any] = {"format": target_format}
+
+    if target_format == "nvfp4":
+        cfg["full_precision_matrix_mult"] = True
+        return cfg
+
+    if "full_precision_matrix_mult" not in layer_config:
+        return cfg
+
+    full_precision = bool(layer_config["full_precision_matrix_mult"])
+    if target_format == "float8_e4m3fn" and not full_precision:
+        return cfg
+
+    cfg["full_precision_matrix_mult"] = full_precision
+    return cfg
 
 
 def save_file_atomically(
@@ -553,24 +617,26 @@ def quantize_checkpoint(
                 compute_dtype=compute_dtype,
                 warned_missing_fp8_scale=warned_missing_fp8_scale,
             )
+            target_format = str(layer_config["format"])
             for state_suffix, state_tensor in state_dict_tensors_for_format(
                 x,
-                str(layer_config["format"]),
+                target_format,
             ).items():
-                output[output_key_for_state_tensor(layer, state_suffix)] = (
-                    state_tensor.detach().cpu().contiguous()
-                )
+                state_tensor = state_tensor.detach().cpu().contiguous()
+                if target_format == "mxfp8":
+                    state_tensor = mxfp8_state_tensor_for_safetensors(
+                        state_suffix,
+                        state_tensor,
+                    )
+                output[output_key_for_state_tensor(layer, state_suffix)] = state_tensor
 
-            output[f"{layer}.comfy_quant"] = torch.tensor(
-                list(json.dumps(layer_config).encode("utf-8")),
-                dtype=torch.uint8,
-            )
-            quantized_layers[recipe_layer] = layer_config
+            quantized_layers[recipe_layer] = official_metadata_layer_config(layer_config)
 
             if device.startswith("cuda") and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
     output_metadata = safetensors_metadata(input_path)
+    output_metadata["format"] = "pt"
     output_metadata["_quantization_metadata"] = merged_quantization_metadata(
         output_metadata,
         quantized_layers,
