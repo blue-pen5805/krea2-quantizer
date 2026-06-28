@@ -21,9 +21,47 @@ RECIPES = {
 
 SUPPORTED_FORMATS = {"float8_e4m3fn", "mxfp8", "nvfp4"}
 
+FP8_SOURCE_FORMATS = {
+    "float8_e4m3fn",
+    "float8_e5m2",
+    "fp8",
+    "fp8_e4m3fn",
+    "fp8_scaled",
+    "tensorcorefp8layout",
+}
+MXFP8_SOURCE_FORMATS = {"mxfp8", "tensorcoremxfp8layout"}
+NVFP4_SOURCE_FORMATS = {"nvfp4", "tensorcorenvfp4layout"}
+INT8_SOURCE_FORMATS = {"int8", "int8_tensorwise", "tensorwise_int8", "tensorwiseint8layout"}
+AWQ_SOURCE_FORMATS = {"awq", "awq_w4a16", "w4a16", "int4_awq", "tensorcoreawqw4a16layout"}
+SVDQUANT_SOURCE_FORMATS = {
+    "svdquant",
+    "svdquant_w4a4",
+    "w4a4",
+    "int4_svdquant",
+    "tensorcoresvdquantw4a4layout",
+}
+SUPPORTED_SOURCE_FORMATS = (
+    FP8_SOURCE_FORMATS
+    | MXFP8_SOURCE_FORMATS
+    | NVFP4_SOURCE_FORMATS
+    | INT8_SOURCE_FORMATS
+    | AWQ_SOURCE_FORMATS
+    | SVDQUANT_SOURCE_FORMATS
+)
+
+MISSING_FP8_SCALE_WARNING = (
+    "WARNING: FP8 source weights have no weight_scale tensors; "
+    "using raw FP8 values directly. Original scaled values cannot be recovered."
+)
+MISSING_FP8_SCALE_WARNING_KEY = "missing_fp8_scale"
+
 AUX_SUFFIXES = (
     ".weight_scale",
     ".weight_scale_2",
+    ".weight_zeros",
+    ".weight_proj_down",
+    ".weight_proj_up",
+    ".weight_smooth_factor",
     ".input_scale",
     ".comfy_quant",
 )
@@ -39,6 +77,7 @@ LAYER_PREFIXES = (
 def load_runtime_dependencies() -> Dict[str, Any]:
     global torch, safe_open, save_file, tqdm
     global QuantizedTensor, TensorCoreFP8Layout, TensorCoreMXFP8Layout, TensorCoreNVFP4Layout
+    global TensorCoreAWQW4A16Layout, TensorCoreSVDQuantW4A4Layout, TensorWiseINT8Layout
 
     try:
         import torch
@@ -47,9 +86,12 @@ def load_runtime_dependencies() -> Dict[str, Any]:
         from tqdm import tqdm
         from comfy_kitchen.tensor import (
             QuantizedTensor,
+            TensorCoreAWQW4A16Layout,
             TensorCoreFP8Layout,
             TensorCoreMXFP8Layout,
             TensorCoreNVFP4Layout,
+            TensorCoreSVDQuantW4A4Layout,
+            TensorWiseINT8Layout,
         )
     except Exception as exc:  # pragma: no cover - environment dependent
         raise SystemExit(
@@ -108,6 +150,30 @@ def quantized_layer_config(f, layer: str) -> Optional[Dict[str, Any]]:
     return json.loads(raw)
 
 
+def normalized_source_format(source_format: Optional[str]) -> Optional[str]:
+    if source_format is None:
+        return None
+    return str(source_format).lower()
+
+
+def infer_source_format(f, layer: str, tensor) -> Optional[str]:
+    cfg = quantized_layer_config(f, layer)
+    source_format = normalized_source_format(cfg.get("format") if cfg else None)
+    if source_format:
+        return source_format
+
+    keys = f.keys()
+    if f"{layer}.weight_proj_down" in keys or f"{layer}.weight_smooth_factor" in keys:
+        return "svdquant_w4a4"
+    if f"{layer}.weight_zeros" in keys:
+        return "awq_w4a16"
+    if str(tensor.dtype).startswith("torch.float8"):
+        return "float8"
+    if str(tensor.dtype) == "torch.int8" and f"{layer}.weight_scale" in keys:
+        return "int8_tensorwise"
+    return None
+
+
 def validate_krea2_source(input_path: Path, layers: Mapping[str, Mapping[str, Any]]) -> str:
     missing = []
     not_2d = []
@@ -126,11 +192,10 @@ def validate_krea2_source(input_path: Path, layers: Mapping[str, Mapping[str, An
             if tensor.ndim != 2:
                 not_2d.append((key, tuple(tensor.shape)))
 
-            cfg = quantized_layer_config(f, full_layer)
-            source_format = cfg.get("format") if cfg else None
+            source_format = infer_source_format(f, full_layer, tensor)
             if tensor.is_floating_point():
                 continue
-            if source_format == "nvfp4":
+            if source_format in SUPPORTED_SOURCE_FORMATS:
                 continue
             not_supported.append((key, str(tensor.dtype), source_format))
 
@@ -157,9 +222,10 @@ def source_precision_summary(
     input_path: Path,
     layers: Mapping[str, Mapping[str, Any]],
     layer_prefix: str,
-) -> tuple[Dict[str, int], Dict[str, int]]:
+) -> tuple[Dict[str, int], Dict[str, int], bool]:
     dtype_counts: Dict[str, int] = {}
     format_counts: Dict[str, int] = {}
+    has_unscaled_fp8 = False
 
     with safe_open(str(input_path), framework="pt", device="cpu") as f:
         for layer in layers:
@@ -168,15 +234,49 @@ def source_precision_summary(
             dtype_name = str(tensor.dtype).replace("torch.", "")
             dtype_counts[dtype_name] = dtype_counts.get(dtype_name, 0) + 1
 
-            cfg = quantized_layer_config(f, full_layer)
-            source_format = str(cfg.get("format")) if cfg and cfg.get("format") else "plain"
+            source_format = infer_source_format(f, full_layer, tensor) or "plain"
             format_counts[source_format] = format_counts.get(source_format, 0) + 1
+            if (
+                source_format in FP8_SOURCE_FORMATS
+                or str(tensor.dtype).startswith("torch.float8")
+            ) and f"{full_layer}.weight_scale" not in f.keys():
+                has_unscaled_fp8 = True
 
-    return dtype_counts, format_counts
+    return dtype_counts, format_counts, has_unscaled_fp8
 
 
 def format_counts(counts: Mapping[str, int]) -> str:
     return ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+
+
+def warn_missing_fp8_scale_once(warned_missing_fp8_scale: set[str]) -> None:
+    if MISSING_FP8_SCALE_WARNING_KEY in warned_missing_fp8_scale:
+        return
+    sys.stdout.flush()
+    print(MISSING_FP8_SCALE_WARNING, file=sys.stderr)
+    warned_missing_fp8_scale.add(MISSING_FP8_SCALE_WARNING_KEY)
+
+
+def require_tensor(f, key: str):
+    if key not in f.keys():
+        raise ValueError(f"Missing source tensor: {key}")
+    return f.get_tensor(key)
+
+
+def infer_awq_group_size(qdata: torch.Tensor, scale: torch.Tensor, cfg: Mapping[str, Any]) -> int:
+    if "group_size" in cfg:
+        return int(cfg["group_size"])
+    if "groupsize" in cfg:
+        return int(cfg["groupsize"])
+    if scale.ndim >= 1 and int(scale.shape[0]) > 0:
+        return int(qdata.shape[1] * 2 // scale.shape[0])
+    return 64
+
+
+def infer_svdquant_orig_shape(qdata: torch.Tensor, smooth_factor: torch.Tensor) -> tuple[int, int]:
+    out_features = TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata)
+    in_features = int(smooth_factor.shape[0])
+    return (out_features, in_features)
 
 
 def tensor_to_compute_dtype(
@@ -185,16 +285,17 @@ def tensor_to_compute_dtype(
     tensor: torch.Tensor,
     device: str,
     compute_dtype: torch.dtype,
+    warned_missing_fp8_scale: set[str],
 ) -> torch.Tensor:
     cfg = quantized_layer_config(f, layer)
-    source_format = cfg.get("format") if cfg else None
+    if cfg is None:
+        cfg = {}
+    source_format = infer_source_format(f, layer, tensor)
     looks_like_fp8 = str(tensor.dtype).startswith("torch.float8")
 
-    if source_format == "mxfp8":
+    if source_format in MXFP8_SOURCE_FORMATS:
         scale_key = f"{layer}.weight_scale"
-        if scale_key not in f.keys():
-            raise ValueError(f"Missing MXFP8 weight_scale for source layer: {layer}")
-        scale = f.get_tensor(scale_key).detach().to(device=device)
+        scale = require_tensor(f, scale_key).detach().to(device=device)
         params = TensorCoreMXFP8Layout.Params(
             scale=scale,
             orig_dtype=compute_dtype,
@@ -203,13 +304,11 @@ def tensor_to_compute_dtype(
         qdata = tensor.detach().to(device=device)
         return QuantizedTensor(qdata, "TensorCoreMXFP8Layout", params).dequantize().to(dtype=compute_dtype)
 
-    if source_format == "nvfp4":
+    if source_format in NVFP4_SOURCE_FORMATS:
         scale_key = f"{layer}.weight_scale_2"
         block_scale_key = f"{layer}.weight_scale"
-        if scale_key not in f.keys() or block_scale_key not in f.keys():
-            raise ValueError(f"Missing NVFP4 scales for source layer: {layer}")
-        scale = f.get_tensor(scale_key).detach().to(device=device)
-        block_scale = f.get_tensor(block_scale_key).detach().to(device=device)
+        scale = require_tensor(f, scale_key).detach().to(device=device)
+        block_scale = require_tensor(f, block_scale_key).detach().to(device=device)
         qdata = tensor.detach().to(device=device)
         params = TensorCoreNVFP4Layout.Params(
             scale=scale,
@@ -219,11 +318,56 @@ def tensor_to_compute_dtype(
         )
         return QuantizedTensor(qdata, "TensorCoreNVFP4Layout", params).dequantize().to(dtype=compute_dtype)
 
-    if source_format in {"float8_e4m3fn", "float8_e5m2"} or looks_like_fp8:
+    if source_format in INT8_SOURCE_FORMATS:
+        scale_key = f"{layer}.weight_scale"
+        scale = require_tensor(f, scale_key).detach().to(device=device)
+        params = TensorWiseINT8Layout.Params(
+            scale=scale,
+            orig_dtype=compute_dtype,
+            orig_shape=tuple(tensor.shape),
+            is_weight=True,
+            convrot=bool(cfg.get("convrot", False)),
+            convrot_groupsize=int(cfg.get("convrot_groupsize", 256)),
+        )
+        qdata = tensor.detach().to(device=device)
+        return QuantizedTensor(qdata, "TensorWiseINT8Layout", params).dequantize().to(dtype=compute_dtype)
+
+    if source_format in AWQ_SOURCE_FORMATS:
+        scale = require_tensor(f, f"{layer}.weight_scale").detach().to(device=device)
+        zeros = require_tensor(f, f"{layer}.weight_zeros").detach().to(device=device)
+        qdata = tensor.detach().to(device=device)
+        params = TensorCoreAWQW4A16Layout.Params(
+            scale=scale,
+            zeros=zeros,
+            orig_dtype=compute_dtype,
+            orig_shape=(int(qdata.shape[0]), int(qdata.shape[1]) * 2),
+            group_size=infer_awq_group_size(qdata, scale, cfg),
+        )
+        return QuantizedTensor(qdata, "TensorCoreAWQW4A16Layout", params).dequantize().to(dtype=compute_dtype)
+
+    if source_format in SVDQUANT_SOURCE_FORMATS:
+        scale = require_tensor(f, f"{layer}.weight_scale").detach().to(device=device)
+        proj_down = require_tensor(f, f"{layer}.weight_proj_down").detach().to(device=device)
+        proj_up = require_tensor(f, f"{layer}.weight_proj_up").detach().to(device=device)
+        smooth_factor = require_tensor(f, f"{layer}.weight_smooth_factor").detach().to(device=device)
+        qdata = tensor.detach().to(device=device)
+        params = TensorCoreSVDQuantW4A4Layout.Params(
+            scale=scale,
+            proj_down=proj_down,
+            proj_up=proj_up,
+            smooth_factor=smooth_factor,
+            orig_dtype=compute_dtype,
+            orig_shape=infer_svdquant_orig_shape(qdata, smooth_factor),
+            act_unsigned=bool(cfg.get("act_unsigned", False)),
+        )
+        return QuantizedTensor(qdata, "TensorCoreSVDQuantW4A4Layout", params).dequantize().to(dtype=compute_dtype)
+
+    if source_format in FP8_SOURCE_FORMATS or looks_like_fp8:
         scale_key = f"{layer}.weight_scale"
         if scale_key not in f.keys():
-            raise ValueError(f"Missing FP8 weight_scale for source layer: {layer}")
-        scale = f.get_tensor(scale_key).detach().to(device=device)
+            warn_missing_fp8_scale_once(warned_missing_fp8_scale)
+            return tensor.to(device=device, dtype=compute_dtype, non_blocking=True)
+        scale = require_tensor(f, scale_key).detach().to(device=device)
         params = TensorCoreFP8Layout.Params(
             scale=scale,
             orig_dtype=compute_dtype,
@@ -277,10 +421,13 @@ def quantize_checkpoint(
     device: str,
     compute_dtype: torch.dtype,
     dry_run: bool,
+    warned_missing_fp8_scale: Optional[set[str]] = None,
 ) -> None:
     target_weight_keys = {f"{layer_prefix}{layer}.weight": f"{layer_prefix}{layer}" for layer in layers}
     output: "OrderedDict[str, torch.Tensor]" = OrderedDict()
     quantized_layers: Dict[str, Dict[str, Any]] = {}
+    if warned_missing_fp8_scale is None:
+        warned_missing_fp8_scale = set()
 
     with safe_open(str(input_path), framework="pt", device="cpu") as f:
         keys = list(f.keys())
@@ -309,6 +456,7 @@ def quantize_checkpoint(
                 tensor=tensor,
                 device=device,
                 compute_dtype=compute_dtype,
+                warned_missing_fp8_scale=warned_missing_fp8_scale,
             )
             for state_suffix, state_tensor in state_dict_tensors_for_format(
                 x,
@@ -394,9 +542,14 @@ def main() -> None:
 
     layer_prefix = validate_krea2_source(args.input, layers)
     print(f"Layer key prefix: {layer_prefix or '(none)'}")
-    dtype_counts, source_format_counts = source_precision_summary(args.input, layers, layer_prefix)
+    dtype_counts, source_format_counts, has_unscaled_fp8 = source_precision_summary(
+        args.input, layers, layer_prefix
+    )
     print(f"Input weight dtypes: {format_counts(dtype_counts)}")
     print(f"Input quant formats: {format_counts(source_format_counts)}")
+    warned_missing_fp8_scale: set[str] = set()
+    if has_unscaled_fp8 and not args.dry_run:
+        warn_missing_fp8_scale_once(warned_missing_fp8_scale)
     quantize_checkpoint(
         input_path=args.input,
         output_path=output_path,
@@ -405,6 +558,7 @@ def main() -> None:
         device=args.device,
         compute_dtype=dtypes[args.compute_dtype],
         dry_run=args.dry_run,
+        warned_missing_fp8_scale=warned_missing_fp8_scale,
     )
 
 
